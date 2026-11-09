@@ -293,6 +293,15 @@ V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_token
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 
 
+class ImageNotCached(ValueError):
+    """A `hash:` image reference (see Vision.hash_key) to a picture this server has not encoded, or has evicted: the
+    client sends those pictures' bytes (a data: URL) instead.  `keys`: the 32-hex keys that were not found."""
+    def __init__(self, keys):
+        self.keys = list(keys)
+        super().__init__("image_not_cached: " + ", ".join(self.keys)
+                         + " - these pictures are not in this server's image cache; send them as data: URLs")
+
+
 class ContextOverflow(ValueError):
     """A request that does not fit the context (a 400 on every API). It keeps the numbers, so /v1/messages can also say it the way Anthropic's API
     does: a client that decides from the wording (Claude Code compacts on "prompt is too long", and shortens max_tokens on "input length and
@@ -3136,6 +3145,7 @@ class StrataEngine:
                 self.progress_ms, self.reused = 0, 0
 
 
+VISION_CACHE_MAX = 64             # encoded pictures kept by default (the vision section's "cache_max" changes it)
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 
 
@@ -3249,6 +3259,9 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        # how many encoded pictures are kept (one ~10 MB .sve each; oldest out): a client that sends `hash:` references
+        # for its history (a computer-use agent, two screenshots a turn) wants more than the 64 that suit a chat
+        self.cache_max = int(cfg.get("cache_max") or VISION_CACHE_MAX)
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -3384,8 +3397,9 @@ class Vision:
         try:
             with self.lock:
                 self._ensure_dir()
-                return all(hashlib.sha256(self.normalize(src if isinstance(src, bytes) else self.load(src))).hexdigest()[:32] in self.cache
-                           for src in sources)
+                return all((self.hash_key(src) if isinstance(src, str) and src.startswith(self.HASH_REF) else
+                            hashlib.sha256(self.normalize(src if isinstance(src, bytes) else self.load(src))).hexdigest()[:32])
+                           in self.cache for src in sources)
         except (ValueError, OSError):
             return False                                # encode() says what is wrong with it
 
@@ -3400,8 +3414,39 @@ class Vision:
         self.stopped = True
         self._start()
 
+    HASH_REF = "hash:"
+
+    @staticmethod
+    def hash_key(source) -> str | None:
+        """A picture sent by reference instead of by its bytes: `hash:<hex>`, the first 32 hex digits of the sha256 of
+        the picture's bytes as a data: URL would carry them (for a JPEG, PNG, BMP or GIF these are the normalized bytes,
+        so the client can compute the key itself; `hash:sha256:<64 hex>` is read too).  The key is the encoder's cache
+        key, so a referenced picture costs no upload and no encode, and the engine's conversation cache matches it as
+        the same picture (#2228).  None for any other source; a malformed reference is a ValueError (a 400)."""
+        if not isinstance(source, str) or not source.startswith(Vision.HASH_REF):
+            return None
+        h = source[len(Vision.HASH_REF):].strip().lower()
+        if h.startswith("sha256:"):
+            h = h[7:]
+        if not re.fullmatch(r"[0-9a-f]{32}(?:[0-9a-f]{32})?", h):
+            raise ValueError("an image hash: reference is hash:<the first 32 hex digits of the sha256 of the picture's "
+                             "bytes> (or hash:sha256:<all 64>)")
+        return h[:32]
+
+    def missing_refs(self, sources: list) -> list[str]:
+        """The `hash:` references of `sources` that are not in the cache, in order, each once."""
+        out: list[str] = []
+        for src in sources:
+            key = self.hash_key(src)
+            if key is not None and key not in self.cache and key not in out:
+                out.append(key)
+        return out
+
     @staticmethod
     def load(source: str) -> bytes:
+        if Vision.hash_key(source) is not None:
+            raise ValueError("a hash: image reference is read from the image encoder's cache only; this request's path "
+                             "needs the picture's bytes (a data: URL)")
         if source.startswith("data:"):
             try:
                 return base64.b64decode(source.split(",", 1)[1])
@@ -3488,6 +3533,10 @@ class Vision:
         """encode() for every image of one request: the files of this request's earlier images are never evicted to
         make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
         had read it).  `cancel` (#1999): a request whose client left does not encode its next pictures."""
+        with self.lock:
+            missing = self.missing_refs(sources)
+        if missing:                                   # all of them in one answer, so the client resends once
+            raise ImageNotCached(missing)
         out: list[tuple[Path, int]] = []
         for src in sources:
             if cancel is not None and cancel.is_set():
@@ -3498,13 +3547,17 @@ class Vision:
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
-        data = self.normalize(source if isinstance(source, bytes) else self.load(source))
-        key = hashlib.sha256(data).hexdigest()[:32]
+        key = self.hash_key(source)
+        data = None if key is not None else self.normalize(source if isinstance(source, bytes) else self.load(source))
+        if data is not None:
+            key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             self._ensure_dir()
             if key in self.cache:
                 self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
+            if data is None:                                           # a hash: reference to a picture not kept
+                raise ImageNotCached([key])
             if self.proc is None or self.proc.stdin is None:           # an elastic encoder not started yet, or one that was unloaded
                 raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -3526,7 +3579,7 @@ class Vision:
             self.warn_if_over_limit(self.cache[key][1])
             held = {str(p) for p in keep} | {str(out)}
             for old in list(self.cache):                               # oldest first, but never one still in use
-                if len(self.cache) <= 64:
+                if len(self.cache) <= self.cache_max:
                     break
                 if str(self.cache[old][0]) not in held:
                     self.cache.pop(old)[0].unlink(missing_ok=True)
@@ -8054,6 +8107,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "image_hash_refs": svc.vision is not None,   # image_url "hash:<key>" (Vision.hash_key)
                                  "image_generation": svc.images is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
@@ -8264,6 +8318,13 @@ def make_handler(svc: Service):
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
+            except ImageNotCached as e:                      # a hash: picture this server does not hold: resend its bytes
+                print(f"[strata] 400 image_not_cached: {len(e.keys)} picture(s)", flush=True)
+                if path == "/v1/responses":
+                    self._json(400, responses_error_body(str(e), code="image_not_cached"))
+                else:
+                    self._json(400, {"error": {"type": "invalid_request_error", "code": "image_not_cached",
+                                               "message": str(e), "missing": e.keys}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
